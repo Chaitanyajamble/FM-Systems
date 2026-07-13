@@ -1,0 +1,166 @@
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import List, Dict, Tuple, Optional
+import heapq
+
+
+# ============================================================================
+# 1. SPACE MANAGEMENT — occupancy & underutilization
+# ============================================================================
+
+@dataclass
+class SpaceRecord:
+    space_id: str
+    capacity: int
+    headcount_samples: List[int] # periodic occupancy sensor/badge readings
+
+
+def utilization_rate(space: SpaceRecord) -> float:
+    if not space.headcount_samples or space.capacity == 0:
+        return 0.0
+    avg_occupied = sum(space.headcount_samples) / len(space.headcount_samples)
+    return avg_occupied / space.capacity
+
+
+def find_underutilized_spaces(spaces: List[SpaceRecord], threshold: float = 0.4) -> List[str]:
+    """Flags spaces below a utilization threshold — drives real-estate
+    consolidation/right-sizing decisions."""
+    return [s.space_id for s in spaces if utilization_rate(s) < threshold]
+
+
+# ============================================================================
+# 2. HYBRID WORKPLACE — desk/room booking
+# ============================================================================
+
+@dataclass
+class Booking:
+    resource_id: str
+    start: datetime
+    end: datetime
+
+
+def has_conflict(existing: List[Booking], new: Booking) -> bool:
+    return any(
+        b.resource_id == new.resource_id and new.start < b.end and b.start < new.end
+        for b in existing
+    )
+
+
+def find_free_slots(bookings: List[Booking], day_start: datetime, day_end: datetime) -> List[Tuple[datetime, datetime]]:
+    """Sweep-line over sorted bookings -> O(n log n)."""
+    bookings = sorted(bookings, key=lambda b: b.start)
+    free, cursor = [], day_start
+    for b in bookings:
+        if b.start > cursor:
+            free.append((cursor, b.start))
+        cursor = max(cursor, b.end)
+    if cursor < day_end:
+        free.append((cursor, day_end))
+    return free
+
+
+# ============================================================================
+# 3. MOVE MANAGEMENT — task dependency ordering
+# ============================================================================
+
+def order_move_tasks(tasks: Dict[str, List[str]]) -> List[str]:
+    """tasks: {task_id: [prerequisite_task_ids]}
+    Returns a valid execution order (Kahn's algorithm, topological sort).
+    Used to sequence a move request: packing -> IT disconnect -> transport -> setup."""
+    in_degree = {t: 0 for t in tasks}
+    for deps in tasks.values():
+        for d in deps:
+            in_degree[d] = in_degree.get(d, 0)
+    for t, deps in tasks.items():
+        in_degree[t] += len(deps)
+
+    queue = [t for t, deg in in_degree.items() if deg == 0]
+    heapq.heapify(queue)
+    order = []
+
+    dependents: Dict[str, List[str]] = {t: [] for t in tasks}
+    for t, deps in tasks.items():
+        for d in deps:
+            dependents.setdefault(d, []).append(t)
+
+    while queue:
+        t = heapq.heappop(queue)
+        order.append(t)
+        for nxt in dependents.get(t, []):
+            in_degree[nxt] -= 1
+            if in_degree[nxt] == 0:
+                heapq.heappush(queue, nxt)
+
+    if len(order) != len(in_degree):
+        raise ValueError("Cycle detected in move task dependencies")
+    return order
+
+
+# ============================================================================
+# 4. REAL ESTATE / SCENARIO PLANNING — lease cost forecasting
+# ============================================================================
+
+def lease_present_value(annual_payments: List[float], discount_rate: float) -> float:
+    """Discounted cash flow — compares lease scenarios (renew vs relocate vs sublease)."""
+    return sum(p / ((1 + discount_rate) ** year) for year, p in enumerate(annual_payments, start=1))
+
+
+def compare_scenarios(scenarios: Dict[str, List[float]], discount_rate: float = 0.05) -> str:
+    """Returns the scenario name with the lowest present-value cost."""
+    pv = {name: lease_present_value(payments, discount_rate) for name, payments in scenarios.items()}
+    return min(pv, key=pv.get)
+
+
+# ============================================================================
+# 5. FACILITY MAINTENANCE (CMMS) — PM scheduling & SLA tracking
+# ============================================================================
+
+@dataclass(order=True)
+class WorkOrder:
+    due_date: datetime
+    priority: int # lower = more urgent
+    order_id: str = field(compare=False)
+    sla_hours: int = field(compare=False, default=24)
+    created_at: datetime = field(compare=False, default_factory=datetime.now)
+
+
+def next_work_order(queue: List[WorkOrder]) -> Optional[WorkOrder]:
+    """Priority queue by (due_date, priority) -> O(log n) dispatch."""
+    if not queue:
+        return None
+    heapq.heapify(queue)
+    return heapq.heappop(queue)
+
+
+def find_sla_breaches(work_orders: List[WorkOrder], now: datetime) -> List[str]:
+    """Flags open work orders that have exceeded their SLA window."""
+    breached = []
+    for wo in work_orders:
+        deadline = wo.created_at + timedelta(hours=wo.sla_hours)
+        if now > deadline:
+            breached.append(wo.order_id)
+    return breached
+
+
+# ============================================================================
+# 6. ASSET MANAGEMENT — depreciation & lifecycle
+# ============================================================================
+
+def straight_line_depreciation(purchase_cost: float, salvage_value: float, useful_life_years: int) -> float:
+    if useful_life_years <= 0:
+        return 0.0
+    return (purchase_cost - salvage_value) / useful_life_years
+
+
+def current_book_value(purchase_cost: float, salvage_value: float, useful_life_years: int, years_in_service: int) -> float:
+    annual_dep = straight_line_depreciation(purchase_cost, salvage_value, useful_life_years)
+    depreciated = min(years_in_service, useful_life_years) * annual_dep
+    return max(purchase_cost - depreciated, salvage_value)
+
+
+# ============================================================================
+# 7. SUSTAINABILITY — energy/water usage trend & anomaly detection
+# ============================================================================
+
+def z_score_anomalies(values: List[float], threshold: float = 2.0) -> List[int]:
+    n = len(values)
